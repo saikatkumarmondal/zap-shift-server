@@ -189,56 +189,75 @@ async function run() {
     });
 
     // ✅ 2. Assign rider to a parcel
-    app.patch("/parcels/:id/assign-rider", async (req, res) => {
-      try {
-        const parcelId = req.params.id;
-        const { riderId, riderName, riderEmail } = req.body;
 
-        if (!riderId || !riderName || !riderEmail) {
-          return res.status(400).json({ message: "Missing rider data" });
+    // PATCH /parcels/:id/assign-rider
+    app.patch("/parcels/:id/assign-rider", async (req, res) => {
+      const { id } = req.params;
+      const { riderId, riderEmail, riderName } = req.body;
+
+      const update = {
+        assigned_rider: true,
+        riderId,
+        riderEmail,
+        riderName,
+        rider_status: "rider_assigned",
+        assigned_at: new Date(), // ← store Picked At here
+      };
+
+      await parcelsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: update }
+      );
+
+      res.json({ message: "Rider assigned and picked_at recorded" });
+    });
+    // PATCH /parcels/:id/cashout
+    app.patch("/parcels/:id/cashout", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!parcel) {
+          return res.status(404).json({ message: "Parcel not found" });
         }
 
-        const parcelsCollection = client
-          .db("zap_shift_user")
-          .collection("parcels");
+        if (parcel.delivery_status !== "delivered") {
+          return res.status(400).json({ message: "Parcel not delivered yet" });
+        }
 
-        const parcelResult = await parcelsCollection.updateOne(
-          { _id: new ObjectId(parcelId) },
+        if (parcel.cashout_status === "cashed_out") {
+          return res.status(400).json({ message: "Parcel already cashed out" });
+        }
+
+        const cashoutTime = new Date();
+
+        await parcelsCollection.updateOne(
+          { _id: new ObjectId(id) },
           {
             $set: {
-              riderId,
-              riderName,
-              riderEmail,
-              rider_status: "rider_assigned",
-              delivery_status: "in-transit",
-              assigned_rider: true, // ✅ new field
-              assigned_at: new Date(),
+              cashout_status: "cashed_out",
+              cashout_at: cashoutTime,
             },
           }
         );
 
-        if (parcelResult.matchedCount === 0) {
-          return res.status(404).json({ message: "Parcel not found" });
-        }
+        const updatedParcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
-        // Update rider status too (optional)
-        const ridersCollection = client
-          .db("zap_shift_user")
-          .collection("riders");
-        await ridersCollection.updateOne(
-          { _id: new ObjectId(riderId) },
-          { $set: { rider_status: "rider_assigned" } }
-        );
-
-        res.json({ success: true, message: "Rider assigned successfully" });
+        res.json({
+          message: "Cashout successful",
+          parcel: updatedParcel,
+        });
       } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Server error", error: error.message });
+        console.error("Cashout error:", error);
+        res.status(500).json({ message: "Server error" });
       }
     });
 
-    // PATCH route to assign rider
-    // PATCH /parcels/:id/assign-rider
     // PATCH /parcels/:id/assign-rider
     app.patch("/parcels/:id/assign-rider", async (req, res) => {
       try {
@@ -362,16 +381,168 @@ async function run() {
     });
 
     // add a rider
-    app.post("/riders", async (req, res) => {
+    // GET /api/rider/completed-parcels?email=<riderEmail>
+    app.get("/api/rider/completed-parcels", async (req, res) => {
       try {
-        const rider = req.body;
-        const result = await ridersCollection.insertOne(rider);
-        res.send(result);
+        const { email } = req.query;
+        if (!email)
+          return res.status(400).json({ message: "Email is required" });
+
+        // Find parcels assigned to this rider
+        const completedParcels = await parcelsCollection
+          .find({
+            riderEmail: email,
+            delivery_status: { $in: ["delivered", "in-transit"] },
+          })
+          .toArray();
+
+        // Add rider earning
+        const parcelsWithEarnings = completedParcels.map((p) => {
+          const cost = p.cost?.$numberInt
+            ? Number(p.cost.$numberInt)
+            : Number(p.cost);
+          const earning =
+            p.sender_region === p.receiver_region ? cost * 0.8 : cost * 0.3;
+          return { ...p, rider_earning: earning };
+        });
+
+        res.json(parcelsWithEarnings);
       } catch (error) {
-        res.status(500).send({ error: error.message });
+        console.error(error);
+        res.status(500).json({ message: "Server error" });
       }
     });
 
+    // PATCH /api/parcels/:id/cashout
+
+    // Express.js + MongoDB
+    app.patch("/api/parcels/:id/cashout", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!parcel) {
+          return res.status(404).json({ message: "Parcel not found" });
+        }
+
+        // Only allow cashout if not already cashed out
+        if (parcel.cashout_status === "cashed_out") {
+          return res.status(400).json({ message: "Parcel already cashed out" });
+        }
+
+        const updateResult = await parcelsCollection.findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              cashout_status: "cashed_out",
+              cashout_at: new Date(),
+            },
+          },
+          { returnDocument: "after" }
+        );
+
+        res.json({
+          message: "Cashout successful",
+          parcel: updateResult.value, // ✅ return updated parcel
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
+    // PATCH /api/rider/:email/cashout-all
+
+    app.get("/api/rider/completed-parcels", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email)
+          return res.status(400).json({ message: "Email is required" });
+
+        const completedParcels = await parcelsCollection
+          .find({
+            riderEmail: email,
+            delivery_status: { $in: ["delivered", "in-transit"] },
+          })
+          .toArray();
+
+        const parcelsWithExtras = completedParcels.map((p) => {
+          // Parse cost
+          const cost = p.cost?.$numberInt
+            ? Number(p.cost.$numberInt)
+            : Number(p.cost);
+
+          // Calculate rider earning
+          const riderEarning =
+            p.sender_region === p.receiver_region ? cost * 0.8 : cost * 0.3;
+
+          // Convert date fields
+          const pickedAt = p.assigned_at?.$date
+            ? new Date(p.assigned_at.$date.$numberLong)
+            : null;
+          const deliveredAt = p.delivered_at?.$date
+            ? new Date(p.delivered_at.$date.$numberLong)
+            : p.delivery_status === "delivered"
+            ? new Date()
+            : null; // or null if in-transit
+          const creationDate = p.creation_date
+            ? new Date(p.creation_date)
+            : null;
+          const cashedAt = p.cashed_at ? new Date(p.cashed_at) : null;
+
+          return {
+            ...p,
+            cost,
+            rider_earning: riderEarning,
+            pickedAt,
+            deliveredAt,
+            creationDate,
+            cashedAt,
+          };
+        });
+
+        res.json(parcelsWithExtras);
+      } catch (error) {
+        console.error("Error fetching completed parcels:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
+    // GET: Load completed parcel deliveries for a rider
+
+    app.get(
+      "/rider/completed-parcel",
+      verifyFireBaseToken,
+      verifyRider,
+      async (req, res) => {
+        try {
+          const email = req.query.email;
+          if (!email) {
+            return res.status(400).send({ message: "Rider email is required" });
+          }
+          const query = {
+            riderEmail: email,
+            delivery_status: {
+              $in: ["delivered", "delivered"],
+            },
+          };
+
+          const options = {
+            sort: { creation_date: -1 },
+          };
+          const completedParcels = await parcelsCollection.find(query, options);
+          res.send(completedParcels);
+        } catch (error) {
+          console.error("Error loading completed parcels:", error);
+          res
+            .status(500)
+            .send({ message: "Failed to load completed deliveries" });
+        }
+      }
+    );
     // Get all pending riders
     app.get(
       "/riders/pending",
@@ -389,6 +560,56 @@ async function run() {
         }
       }
     );
+    app.patch("/api/parcels/:id/cashout", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!parcel)
+          return res.status(404).json({ message: "Parcel not found" });
+
+        if (parcel.delivery_status !== "delivered") {
+          return res.status(400).json({ message: "Parcel not delivered yet" });
+        }
+
+        await parcelsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { cashout_status: "cashed_out", cashed_at: new Date() } }
+        );
+
+        res.json({ message: "Cashout successful" });
+      } catch (error) {
+        console.error("Error cashing out parcel:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
+    app.patch("/api/rider/:email/cashout-all", async (req, res) => {
+      try {
+        const { email } = req.params;
+
+        const result = await parcelsCollection.updateMany(
+          {
+            riderEmail: email,
+            delivery_status: "delivered",
+            $or: [
+              { cashout_status: { $exists: false } },
+              { cashout_status: "not_cashed" },
+            ],
+          },
+          { $set: { cashout_status: "cashed_out", cashed_at: new Date() } }
+        );
+
+        res.json({
+          message: `Cashout completed for ${result.modifiedCount} parcels.`,
+        });
+      } catch (error) {
+        console.error("Error cashing out all parcels:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
 
     // update rider status active or rejected
     // PATCH /api/parcels/:id/assign-rider
@@ -483,6 +704,7 @@ async function run() {
         }
 
         // PATCH: Update parcel delivery_status
+        // PATCH: Toggle delivery status and set timestamps
         app.patch("/parcels/:id/toggle-delivery", async (req, res) => {
           try {
             const { id } = req.params;
@@ -494,24 +716,32 @@ async function run() {
               return res.status(404).json({ message: "Parcel not found" });
             }
 
-            // Toggle delivery_status
-            const newStatus =
+            let newStatus =
               parcel.delivery_status === "delivered"
                 ? "in-transit"
                 : "delivered";
+            let updateFields = { delivery_status: newStatus };
+
+            // Add timestamps
+            if (newStatus === "in-transit") {
+              updateFields.picked_at = new Date().toISOString();
+            } else if (newStatus === "delivered") {
+              updateFields.delivered_at = new Date().toISOString();
+            }
 
             await parcelsCollection.updateOne(
               { _id: new ObjectId(id) },
-              { $set: { delivery_status: newStatus } }
+              { $set: updateFields }
             );
 
             res.json({
               success: true,
-              message: `Parcel ${newStatus}`,
+              message: `Parcel marked as ${newStatus}`,
               newStatus,
+              timestamps: updateFields,
             });
           } catch (error) {
-            console.error(error);
+            console.error("Error toggling delivery:", error);
             res.status(500).json({ message: "Server error" });
           }
         });
